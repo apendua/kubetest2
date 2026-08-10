@@ -19,8 +19,11 @@ package exec
 import (
 	"context"
 	"io"
-	osexec "os/exec"
+	"os"
 	"strings"
+	"time"
+
+	osexec "os/exec"
 
 	"k8s.io/klog/v2"
 )
@@ -48,8 +51,16 @@ func (c *LocalCmder) Command(name string, arg ...string) Cmd {
 // CommandContext returns a new exec.Cmd with the context, backed by Cmd
 func (c *LocalCmder) CommandContext(ctx context.Context, name string, arg ...string) Cmd {
 	klog.V(2).Infof("⚙️ %s %s", name, strings.Join(arg, " "))
+	cmd := osexec.CommandContext(ctx, name, arg...)
+
+	// Gracefully interrupt the child process on context cancellation
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(os.Interrupt)
+	}
+	// Force kill if it doesn't exit within 10 minutes of being interrupted
+	cmd.WaitDelay = 10 * time.Minute
 	return &LocalCmd{
-		Cmd: osexec.CommandContext(ctx, name, arg...),
+		Cmd: cmd,
 	}
 }
 

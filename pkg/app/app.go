@@ -17,6 +17,7 @@ limitations under the License.
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -87,28 +88,20 @@ func RealMain(opts types.Options, d types.Deployer, tester types.Tester) (result
 	}
 	writer := metadata.NewWriter("kubetest2", junitRunner)
 
-	done := make(chan bool)
-	defer func() { done <- true }()
-	go func() {
-		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	normalExit := make(chan struct{})
+	defer func() {
+		close(normalExit)
+		cancel()
+	}()
 
-		// catch interrupt signals and gracefully attempt to clean up
-		for {
-			select {
-			case <-c:
-				if opts.ShouldUp() || opts.ShouldTest() {
-					if opts.ShouldDown() {
-						klog.Info("Captured ^C, gracefully attempting to cleanup resources..")
-						if err := writer.WrapStep("Down", d.Down); err != nil {
-							result = err
-						}
-					}
-					os.Exit(0)
-				}
-			case <-done:
-				return
-			}
+	go func() {
+		<-ctx.Done()
+		select {
+		case <-normalExit:
+			// Normal exit, do nothing
+		default:
+			klog.Info("Captured interrupt, gracefully attempting to cleanup resources..")
 		}
 	}()
 
@@ -195,7 +188,7 @@ func RealMain(opts types.Options, d types.Deployer, tester types.Tester) (result
 	if len(opts.PreTestCmd()) > 0 {
 		preTestArgs := expandEnv(opts.PreTestCmd())
 		klog.Infof("Running pre-test-cmd: %v", preTestArgs)
-		preTest := exec.Command(preTestArgs[0], preTestArgs[1:]...)
+		preTest := exec.CommandContext(ctx, preTestArgs[0], preTestArgs[1:]...)
 		exec.InheritOutput(preTest)
 		preTest.SetEnv(envsForTester...)
 		if err := writer.WrapStep("PreTestCmd", preTest.Run); err != nil {
@@ -206,7 +199,7 @@ func RealMain(opts types.Options, d types.Deployer, tester types.Tester) (result
 	var postTestErr, testErr error
 	// and finally test, if a test was specified
 	if opts.ShouldTest() {
-		test := exec.Command(tester.TesterPath, tester.TesterArgs...)
+		test := exec.CommandContext(ctx, tester.TesterPath, tester.TesterArgs...)
 		exec.InheritOutput(test)
 		test.SetEnv(envsForTester...)
 
@@ -218,7 +211,7 @@ func RealMain(opts types.Options, d types.Deployer, tester types.Tester) (result
 	}
 
 	// run post-test-cmd if specified, after the tester
-	if err := runPostTestCmd(opts.PostTestCmd(), envsForTester, writer); err != nil {
+	if err := runPostTestCmd(ctx, opts.PostTestCmd(), envsForTester, writer); err != nil {
 		postTestErr = err
 	}
 
@@ -283,11 +276,11 @@ func expandEnv(args []string) []string {
 	return expandedArgs
 }
 
-func runPostTestCmd(postTestCmd []string, envs []string, writer *metadata.Writer) error {
+func runPostTestCmd(ctx context.Context, postTestCmd []string, envs []string, writer *metadata.Writer) error {
 	if len(postTestCmd) > 0 {
 		postTestArgs := expandEnv(postTestCmd)
 		klog.Infof("Running post-test-cmd: %v", postTestArgs)
-		postTest := exec.Command(postTestArgs[0], postTestArgs[1:]...)
+		postTest := exec.CommandContext(ctx, postTestArgs[0], postTestArgs[1:]...)
 		exec.InheritOutput(postTest)
 		postTest.SetEnv(envs...)
 		if err := writer.WrapStep("PostTestCmd", postTest.Run); err != nil {
